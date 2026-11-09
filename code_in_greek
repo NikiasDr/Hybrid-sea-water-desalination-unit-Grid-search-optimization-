@@ -1,0 +1,274 @@
+import math
+import numpy as np
+import pandas as pd
+import scipy.stats as stats
+import matplotlib.pyplot as plt
+
+# ==============================================================================
+# 1. ΠΑΡΑΜΕΤΡΟΙ ΠΡΟΒΛΗΜΑΤΟΣ (ΔΕΔΟΜΕΝΑ ΦΟΙΤΗΤΗ #17 - mc23906)
+# ==============================================================================
+V_extank = 210 * 1000       # (m3) Χωρητικότητα υφιστάμενης δεξαμενής (210.000 m3)
+Yrneeds = 7.3 * 1e6         # (m3/έτος) Ετήσιες ανάγκες νερού (7.300.000 m3)
+Q_nominal = 12800           # (m3/day) Ημερήσια δυναμικότητα μονάδας αφαλάτωσης
+SEC = 4.0                   # (kWh/m3) Ειδική κατανάλωση ενέργειας αφαλάτωσης
+
+# True: Κάθε μονάδα αφαλάτωσης έχει δυναμικότητα 12.800 m3/day
+IS_Q_PER_UNIT = True        
+
+# Οικονομικά Δεδομένα
+C_windunit = 1350           # (€/kW) Κόστος αιολικού πάρκου
+C_solarunit = 800           # (€/kWp) Κόστος φωτοβολταϊκού πάρκου
+C_desalunit = 900           # (€/(m3/day)) Κόστος μονάδας αφαλάτωσης
+lamda_tank = 1000.0         # Συντελεστής λ κόστους νέας δεξαμενής (CR = λ * V^a)
+alpha_tank = 0.6            # Εκθέτης α κόστους νέας δεξαμενής
+
+i_rate = 0.06               # (6%) Επιτόκιο προεξόφλησης
+N_years = 20                # (έτη) Διάρκεια ζωής έργου
+R_factor = i_rate / (1 - (1 + i_rate)**(-N_years)) # Συντελεστής ετήσιας αναγωγής
+
+# Στόχος κάλυψης ζήτησης για το Grid Search
+TARGET_COVERAGE = 0.95      # 95% 
+
+
+
+months_data = [
+    {'name': 'Jan', 'days': 31, 'demand_pct': 0.06, 'pv_wh_per_kwp': 80896.0},
+    {'name': 'Feb', 'days': 28, 'demand_pct': 0.07, 'pv_wh_per_kwp': 88084.0},
+    {'name': 'Mar', 'days': 31, 'demand_pct': 0.07, 'pv_wh_per_kwp': 132648.0},
+    {'name': 'Apr', 'days': 30, 'demand_pct': 0.08, 'pv_wh_per_kwp': 119648.0},
+    {'name': 'May', 'days': 31, 'demand_pct': 0.09, 'pv_wh_per_kwp': 145712.0},
+    {'name': 'Jun', 'days': 30, 'demand_pct': 0.11, 'pv_wh_per_kwp': 147961.0},
+    {'name': 'Jul', 'days': 31, 'demand_pct': 0.12, 'pv_wh_per_kwp': 146425.0},
+    {'name': 'Aug', 'days': 31, 'demand_pct': 0.11, 'pv_wh_per_kwp': 144810.0},
+    {'name': 'Sep', 'days': 30, 'demand_pct': 0.09, 'pv_wh_per_kwp': 123901.0},
+    {'name': 'Oct', 'days': 31, 'demand_pct': 0.07, 'pv_wh_per_kwp': 102396.0},
+    {'name': 'Nov', 'days': 30, 'demand_pct': 0.07, 'pv_wh_per_kwp': 78382.0},
+    {'name': 'Dec', 'days': 31, 'demand_pct': 0.06, 'pv_wh_per_kwp': 69114.0}, 
+      ]
+
+for m in months_data:
+    m['water_demand'] = m['demand_pct'] * Yrneeds
+    m['pv_kwh_per_kwp'] = m['pv_wh_per_kwp'] / 1000.0
+    m['hours'] = m['days'] * 24
+
+# ==============================================================================
+# 2. ΑΝΑΛΥΣΗ ΑΝΕΜΟΥ & ΚΑΜΠΥΛΗ ΙΣΧΥΟΣ ΑΝΕΜΟΓΕΝΝΗΤΡΙΑΣ (1 MW)
+# ==============================================================================
+def wind_analysis(excel_path='D1_D100_3Years(2).xlsx'):
+    try:
+        df = pd.read_excel(excel_path, sheet_name='wind', usecols='R', skiprows=2)
+        wind_speeds = df.iloc[:, 0].dropna().values
+        wind_speeds = wind_speeds[wind_speeds > 0]
+        mean_v = np.mean(wind_speeds)
+        std_v = np.std(wind_speeds)
+        shape_k = (std_v / mean_v) ** (-1.086)
+        scale_c = mean_v / math.gamma(1 + (1 / shape_k))
+    except FileNotFoundError:
+        print("[ΠΡΟΣΟΧΗ] Δεν βρέθηκε το αρχείο Excel στον φάκελο. Χρήση ενδεικτικών τιμών.")
+        mean_v, std_v = 7.53, 3.94
+        shape_k, scale_c = 2.0, 8.5
+    return shape_k, scale_c, mean_v, std_v
+
+known_speeds = np.arange(0, 26, 1)
+known_power_kw = np.array([
+    0, 0, 0, 19, 45, 88, 152, 241, 360, 513, 703, 936,
+    1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000,
+    1000, 1000, 1000, 1000, 1000, 1000
+])
+
+v_grid = np.arange(0, 25.1, 0.2)
+single_wt_power_at_v = np.interp(v_grid, known_speeds, known_power_kw)
+
+# ==============================================================================
+# 3. ΣΥΝΑΡΤΗΣΗ ΠΡΟΣΟΜΟΙΩΣΗΣ (ΜΕ ΕΛΕΓΧΟ ΑΝΑΓΚΑΙΟΤΗΤΑΣ ΝΕΑΣ ΔΕΞΑΜΕΝΗΣ)
+# ==============================================================================
+def simulate_system(n_wt, pv_kwp, n_desal, new_tank_m3, prob_density):
+    if IS_Q_PER_UNIT:
+        q_unit_day = Q_nominal
+        total_q_day = Q_nominal * n_desal
+    else:
+        q_unit_day = Q_nominal / n_desal
+        total_q_day = Q_nominal
+
+    q_unit_hour = q_unit_day / 24.0
+    p_unit_kw = q_unit_hour * SEC
+
+    tank_capacity = V_extank + new_tank_m3
+    # Ξεκινάμε με την υφιστάμενη δεξαμενή στο 50%
+    tank_level = 0.5 * V_extank
+
+    total_water_produced = 0.0
+    total_demand_met = 0.0
+    total_wasted_water_m3 = 0.0  # Νερό που θα παραγόταν αλλά η δεξαμενή ήταν γεμάτη!
+    total_deficit_m3 = 0.0       # Νερό που έλειψε τους μήνες αιχμής
+
+    for m in months_data:
+        day_hours = m['days'] * 10.0
+        night_hours = m['hours'] - day_hours
+        
+        pv_energy_month_kwh = pv_kwp * m['pv_kwh_per_kwp']
+        avg_pv_power_day_kw = pv_energy_month_kwh / day_hours if day_hours > 0 else 0.0
+        wind_power_kw = n_wt * single_wt_power_at_v
+
+        # Ημέρα (Άνεμος + Φ/Β)
+        avail_power_day_kw = wind_power_kw + avg_pv_power_day_kw
+        units_on_day = np.minimum(n_desal, np.floor(avail_power_day_kw / p_unit_kw))
+        water_rate_day_m3h = units_on_day * q_unit_hour
+        exp_water_day_m3 = np.trapezoid(water_rate_day_m3h * prob_density, v_grid) * day_hours
+
+        # Νύχτα (Μόνο Άνεμος)
+        avail_power_night_kw = wind_power_kw
+        units_on_night = np.minimum(n_desal, np.floor(avail_power_night_kw / p_unit_kw))
+        water_rate_night_m3h = units_on_night * q_unit_hour
+        exp_water_night_m3 = np.trapezoid(water_rate_night_m3h * prob_density, v_grid) * night_hours
+
+        potential_water_m3 = exp_water_day_m3 + exp_water_night_m3
+        month_demand_m3 = m['water_demand']
+
+        # Ισοζύγιο Δεξαμενής Νερού
+        net_water = potential_water_m3 - month_demand_m3
+        if net_water >= 0:
+            demand_met = month_demand_m3
+            space_in_tank = tank_capacity - tank_level
+            stored_water = min(net_water, space_in_tank)
+            tank_level += stored_water
+            actual_water_produced = month_demand_m3 + stored_water
+            
+            # Καταγραφή νερού που απορρίφθηκε λόγω γεμάτης δεξαμενής
+            wasted_this_month = net_water - stored_water
+            total_wasted_water_m3 += wasted_this_month
+        else:
+            deficit = -net_water
+            drawn_from_tank = min(tank_level, deficit)
+            tank_level -= drawn_from_tank
+            demand_met = potential_water_m3 + drawn_from_tank
+            actual_water_produced = potential_water_m3
+            
+            # Καταγραφή ακάλυπτης ζήτησης
+            unmet_this_month = deficit - drawn_from_tank
+            total_deficit_m3 += unmet_this_month
+
+        total_water_produced += actual_water_produced
+        total_demand_met += demand_met
+
+    # Οικονομικοί Υπολογισμοί
+    capex_wind = n_wt * 1000.0 * C_windunit
+    capex_pv = pv_kwp * C_solarunit
+    capex_desal = total_q_day * C_desalunit
+    # Κόστος νέας δεξαμενής: CR = 1000 * V^0.6 (μόνο αν new_tank_m3 > 0)
+    capex_tank = lamda_tank * (new_tank_m3 ** alpha_tank) if new_tank_m3 > 0 else 0.0
+
+    total_capex = capex_wind + capex_pv + capex_desal + capex_tank
+    opex = 0.03 * total_capex
+
+    if total_water_produced > 0:
+        lcow = (total_capex * R_factor + opex) / total_water_produced
+    else:
+        lcow = float('inf')
+
+    coverage = (total_demand_met / Yrneeds) * 100.0
+
+    return {
+        'n_desal': n_desal,
+        'n_wt': n_wt,
+        'pv_kwp': pv_kwp,
+        'new_tank_m3': new_tank_m3,
+        'tank_cost_eur': capex_tank,
+        'lcow': lcow,
+        'coverage_pct': coverage,
+        'water_produced_m3': total_water_produced,
+        'wasted_water_m3': total_wasted_water_m3,
+        'deficit_m3': total_deficit_m3,
+        'capex_m_eur': total_capex / 1e6
+    }
+
+# ==============================================================================
+# 4. ΑΛΓΟΡΙΘΜΟΣ 4D GRID SEARCH (ΜΕ ΕΞΥΠΝΗ ΕΝΕΡΓΟΠΟΙΗΣΗ ΝΕΑΣ ΔΕΞΑΜΕΝΗΣ)
+# ==============================================================================
+def run_grid_search():
+    print("==== 1. ΣΤΑΤΙΣΤΙΚΗ ΑΝΑΛΥΣΗ ΑΝΕΜΟΥ ====")
+    shape_k, scale_c, mean_v, std_v = wind_analysis()
+    print(f"Μέση Ταχύτητα Ανέμου: {mean_v:.2f} m/s | Τυπική Απόκλιση: {std_v:.2f} m/s")
+    print(f"Παράμετροι Weibull -> k: {shape_k:.2f}, c: {scale_c:.2f} m/s\n")
+
+    prob_density = stats.weibull_min.pdf(v_grid, c=shape_k, scale=scale_c)
+
+    # Όρια Grid Search
+    desal_range = [2, 3, 4, 5]                      # 2 έως 5 μονάδες αφαλάτωσης
+    wt_range = range(0, 26, 1)                      # 0 έως 25 Ανεμογεννήτριες (1 MW)
+    pv_range = range(0, 31000, 2000)                # 0 έως 30.000 kWp Φ/Β (βήμα 2.000 kWp)
+    # Υποψήφια μεγέθη νέας δεξαμενής (σε m3) αν χρειαστεί έξτρα αποθήκευση
+    extra_tank_options = [10000, 50000, 100000, 150000, 200000, 300000]
+
+    results = []
+    extra_tank_trials = 0
+
+    print("==== 2. ΕΚΤΕΛΕΣΗ 4D GRID SEARCH ====")
+    for n_desal in desal_range:
+        for n_wt in wt_range:
+            for pv_kwp in pv_range:
+                if n_wt == 0 and pv_kwp == 0:
+                    continue
+
+                # ΒΗΜΑ 1: Προσομοίωση ΧΩΡΙΣ νέα δεξαμενή (new_tank_m3 = 0)
+                base_res = simulate_system(n_wt, pv_kwp, n_desal, 0, prob_density)
+                results.append(base_res)
+
+                # ΒΗΜΑ 2: Έλεγχος αν είναι ΑΠΑΡΑΙΤΗΤΗ η νέα δεξαμενή!
+                # Χρειάζεται νέα δεξαμενή ΜΟΝΟ αν:
+                # α) Η υφιστάμενη δεξαμενή (210.000 m3) γέμισε κάποιον μήνα (wasted_water_m3 > 0)
+                # β) ΚΑΙ υπήρξε έλλειμμα νερού σε άλλον μήνα (deficit_m3 > 0)
+                if base_res['wasted_water_m3'] > 0 and base_res['deficit_m3'] > 0:
+                    for extra_v in extra_tank_options:
+                        extra_tank_trials += 1
+                        tank_res = simulate_system(n_wt, pv_kwp, n_desal, extra_v, prob_density)
+                        results.append(tank_res)
+                        # Αν το μέγεθος της νέας δεξαμενής απορρόφησε όλο το πλεόνασμα,
+                        # δεν χρειάζεται να δοκιμάσουμε ακόμα μεγαλύτερη δεξαμενή!
+                        if tank_res['wasted_water_m3'] == 0:
+                            break
+
+    df_res = pd.DataFrame(results)
+    print(f"Συνολικά εξετάστηκαν {len(df_res)} σενάρια (εκ των οποίων {extra_tank_trials} με νέα δεξαμενή).")
+
+    # Φιλτράρισμα σεναρίων με βάση την επιθυμητή κάλυψη ζήτησης (>= 95%)
+    target_pct = TARGET_COVERAGE * 100.0
+    valid_scenarios = df_res[df_res['coverage_pct'] >= target_pct].copy()
+
+    if valid_scenarios.empty:
+        print(f"\n[!] Κανένα σενάριο δεν έπιασε το {target_pct:.1f}% κάλυψης.")
+        best_df = df_res.sort_values(by=['coverage_pct', 'lcow'], ascending=[False, True])
+    else:
+        best_df = valid_scenarios.sort_values(by='lcow', ascending=True)
+
+    best = best_df.iloc[0]
+
+    print("\n" + "="*60)
+    print(f" ΒΕΛΤΙΣΤΟ ΣΕΝΑΡΙΟ (Στόχος Κάλυψης >= {target_pct:.1f}%)")
+    print("="*60)
+    print(f"• LCOW (Κόστος Νερού 1 έτους):     {best['lcow']:.3f} €/m³")
+    print(f"• Μονάδες Αφαλάτωσης:              {int(best['n_desal'])} μονάδες")
+    print(f"• Αριθμός Ανεμογεννητριών (1MW):   {int(best['n_wt'])} Α/Γ ({int(best['n_wt'])} MW)")
+    print(f"• Εγκατεστημένη Ισχύς Φ/Β:         {int(best['pv_kwp'])} kWp ({best['pv_kwp']/1000:.1f} MWp)")
+    print(f"• Νέα Συμπληρωματική Δεξαμενή:     {int(best['new_tank_m3']):,} m³ (Κόστος: {best['tank_cost_eur']:,.0f} €)")
+    print(f"• Κάλυψη Ζήτησης Νερού:            {best['coverage_pct']:.2f} %")
+    print(f"• Ετήσια Παραγωγή Νερού:           {best['water_produced_m3']:,.0f} m³")
+    print(f"• Συνολικό CAPEX Έργου:            {best['capex_m_eur']:.2f} εκατ. €")
+    print("="*60)
+
+    print("\nTop 5 Καλύτερα Σενάρια (Σύγκριση):")
+    cols = ['n_desal', 'n_wt', 'pv_kwp', 'new_tank_m3', 'coverage_pct', 'lcow', 'capex_m_eur']
+    print(best_df[cols].head(5).to_string(index=False))
+
+    # Εμφάνιση και του καλύτερου σεναρίου ΠΟΥ ΧΡΗΣΙΜΟΠΟΙΕΙ νέα δεξαμενή (για σχολιασμό στην εργασία!)
+    with_tank_df = valid_scenarios[valid_scenarios['new_tank_m3'] > 0].sort_values(by='lcow', ascending=True)
+    if not with_tank_df.empty:
+        bt = with_tank_df.iloc[0]
+        print("\n--- Καλύτερο Σενάριο ΜΕ Κατασκευή Νέας Δεξαμενής (για την τεχνική έκθεση) ---")
+        print(f"Α/Γ: {int(bt['n_wt'])} MW | Φ/Β: {int(bt['pv_kwp'])} kWp | Μονάδες: {int(bt['n_desal'])} | "
+              f"Νέα Δεξαμενή: {int(bt['new_tank_m3']):,} m³ | Κάλυψη: {bt['coverage_pct']:.2f}% | LCOW: {bt['lcow']:.3f} €/m³")
+
+    return df_res, best
+
+if __name__ == '__main__':
+    df_results, optimal_solution = run_grid_search()
